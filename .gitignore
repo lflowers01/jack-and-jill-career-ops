@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.dpapi
+.env
+output/
+*.sent.json
