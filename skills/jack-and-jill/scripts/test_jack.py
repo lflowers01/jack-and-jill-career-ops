@@ -5,13 +5,14 @@ import tempfile
 import unittest
 import uuid
 import zipfile
+from unittest.mock import patch
 from pathlib import Path
 
 import httpx
 import win32crypt
 
 from jack_client import API, CLERK, JackClient, JackHTTPError, docx_text
-from jack import accept_suggestion, decide_suggestion, export_cv, simulation_receipt
+from jack import accept_suggestion, decide_suggestion, export_cv, simulation_receipt, resolve_note, check_resume_policy, run_chat, main
 
 JOB = str(uuid.uuid4())
 VERSION = str(uuid.uuid4())
@@ -119,14 +120,229 @@ class Tests(unittest.TestCase):
             root = Path(directory)
             client = Fake(True)
             with self.assertRaises(ValueError):
-                export_cv(client, JOB, {'job_match_id': JOB, 'review_id': 'review'}, root)
+                export_cv(client, JOB, {'job_match_id': JOB, 'review_id': 'review'}, root, policy={})
             self.assertFalse(list(root.iterdir()))
             client = Fake()
             with self.assertRaises(ValueError):
-                export_cv(client, JOB, {'job_match_id': str(uuid.uuid4()), 'review_id': 'review'}, root)
-            receipt = export_cv(client, JOB, {'job_match_id': JOB, 'review_id': 'review'}, root)
+                export_cv(client, JOB, {'job_match_id': str(uuid.uuid4()), 'review_id': 'review'}, root, policy={})
+            receipt = export_cv(client, JOB, {'job_match_id': JOB, 'review_id': 'review'}, root, policy={})
             self.assertEqual(Path(receipt['path']).read_bytes(), docx())
             self.assertEqual(receipt['text'], 'Robotics intern')
+
+    def test_resume_policy_blocks_status_variants_but_preserves_fundraising(self):
+        policy = {'forbid_work_authorization': True}
+        for text in ['Authorized to work in the US', 'U.S. work-authorized', 'Work\n authorization: eligible',
+                     'No sponsorship required', 'Does not require sponsorship', 'Visa sponsorship: not needed',
+                     'Sponsorship is not required', 'US citizen', 'Permanent resident', 'Work‑authorized',
+                     'Eligible to work in the US', 'Work eligibility: unrestricted', 'Visa status: F1',
+                     'F-1 visa', 'Requires sponsorship', 'Sponsorship: none']:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                check_resume_policy(text, policy)
+        check_resume_policy('Raised funds through grants and sponsorships for a robotics team.', policy)
+        check_resume_policy('Robotics student', policy)
+        with self.assertRaises(ValueError):
+            check_resume_policy('An UNVERIFIED\nGPA placeholder', {'forbidden_phrases': ['unverified GPA']})
+        for invalid in ([], {'forbid_work_authorization': 'false'}, {'forbidden_phrases': [None]}):
+            with self.assertRaises(ValueError):
+                check_resume_policy('Robotics student', invalid)
+
+    def test_export_blocks_unknown_or_missing_thread_status(self):
+        for status in (None, 'processing', 'future_api_status'):
+            client = Fake()
+            client.version['threads'][0]['status'] = status
+            with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, 'unknown status'):
+                export_cv(client, JOB, {'job_match_id': JOB, 'review_id': 'review'}, Path(directory), policy={})
+
+    def test_policy_is_loaded_from_data_root_and_checked_before_any_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'config').mkdir()
+            (root / 'config' / 'jack-and-jill.json').write_text(json.dumps({'forbidden_phrases': ['Robotics intern']}))
+            with patch('jack.data_root', return_value=root), self.assertRaisesRegex(ValueError, 'forbidden'):
+                export_cv(Fake(), JOB, {'job_match_id': JOB, 'review_id': 'review'}, root / 'final')
+            self.assertFalse((root / 'final').exists())
+
+    def test_resolve_note_confirms_reply_cloned_ids_and_terminal_status_without_duplicates(self):
+        class Comments(Fake):
+            def request(self, method, path, **kwargs):
+                self.writes.append((method, path, kwargs))
+                t = self.version['threads'][0]
+                if path.endswith('/reply'):
+                    t.setdefault('replies', []).append({'author': 'candidate', 'text': kwargs['json']['text']})
+                else:
+                    t['status'] = 'resolved'
+                t['id'] = str(uuid.uuid4())
+                return self.version
+        client = Comments(True)
+        t = client.version['threads'][0]
+        t.update(kind='comment', after=None, title='Unknown GPA')
+        reviewed = {'thread': dict(t), 'reason': 'Source: confirmed profile has no Purdue GPA; keep the GPA omitted.'}
+        with tempfile.TemporaryDirectory() as directory:
+            op = Path(directory) / 'resolution.json'
+            result = resolve_note(client, JOB, THREAD, reviewed, op)
+            self.assertEqual(result['threads'][0]['status'], 'resolved')
+            resolve_note(client, JOB, THREAD, reviewed, op)
+            self.assertEqual(len(client.writes), 2)
+
+    def test_note_uncertain_reply_is_never_resent_and_rejected_is_not_resolved(self):
+        class NoReply(Fake):
+            def request(self, method, path, **kwargs):
+                self.writes.append((method, path, kwargs))
+                raise httpx.ReadTimeout('delivery uncertain')
+        client = NoReply(True)
+        client.version['threads'][0].update(kind='comment', after=None)
+        reviewed = {'reason': 'Source: candidate has no confirmed PLC experience, so no PLC claim was added.'}
+        with tempfile.TemporaryDirectory() as directory:
+            op = Path(directory) / 'resolution.json'
+            for _ in range(2):
+                with self.assertRaisesRegex(ValueError, 'No .*retried|No reply resent'):
+                    resolve_note(client, JOB, THREAD, reviewed, op)
+            self.assertEqual(len(client.writes), 1)
+            client.version['threads'][0]['status'] = 'rejected'
+            with self.assertRaisesRegex(ValueError, 'terminal status'):
+                resolve_note(client, JOB, THREAD, reviewed, op)
+
+    def test_note_committed_conflict_reconciles_but_unconfirmed_decision_never_resends(self):
+        class Conflict(Fake):
+            committed = False
+            def request(self, method, path, **kwargs):
+                self.writes.append((method, path, kwargs))
+                t = self.version['threads'][0]
+                if path.endswith('/reply'):
+                    t.setdefault('replies', []).append({'author': 'candidate', 'text': kwargs['json']['text']})
+                    return self.version
+                if self.committed:
+                    t['status'] = 'resolved'
+                raise JackHTTPError(409, method, path)
+        for committed in (False, True):
+            client = Conflict(True)
+            client.committed = committed
+            client.version['threads'][0].update(kind='comment', after=None)
+            reviewed = {'reason': 'Source: no verified GPA is available; omit the proposed GPA field entirely.'}
+            with tempfile.TemporaryDirectory() as directory:
+                op = Path(directory) / 'resolution.json'
+                if committed:
+                    self.assertTrue(resolve_note(client, JOB, THREAD, reviewed, op)['reconciled_after_conflict'])
+                else:
+                    for _ in range(2):
+                        with self.assertRaises(ValueError):
+                            resolve_note(client, JOB, THREAD, reviewed, op)
+                self.assertEqual(len(client.writes), 2)
+
+    def test_export_accepts_resolved_comments_but_not_accepted_or_unknown_comments(self):
+        for status in ('resolved', 'accepted', 'rejected', None):
+            client = Fake()
+            client.version['threads'].append({'id': str(uuid.uuid4()), 'kind': 'comment', 'status': status})
+            with tempfile.TemporaryDirectory() as directory:
+                if status == 'resolved':
+                    export_cv(client, JOB, {'job_match_id': JOB, 'review_id': 'review'}, Path(directory), policy={})
+                else:
+                    with self.assertRaisesRegex(ValueError, 'unknown status'):
+                        export_cv(client, JOB, {'job_match_id': JOB, 'review_id': 'review'}, Path(directory), policy={})
+
+    def test_interrupted_chat_preserves_events_and_blocks_duplicate_run(self):
+        class Interrupted:
+            calls = 0
+            def chat(self, message, message_id, on_event):
+                self.calls += 1
+                on_event({'type': 'text-delta', 'delta': 'Saved partial result'})
+                raise httpx.ReadTimeout('interrupted')
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'run.json'
+            client = Interrupted()
+            meta = {'command': 'refine', 'job_match_id': JOB, 'source_version_id': VERSION}
+            with self.assertRaises(httpx.ReadTimeout):
+                run_chat(client, 'Refine', str(uuid.uuid4()), output, meta)
+            saved = json.loads(output.read_text())
+            self.assertEqual(saved['events'][0]['delta'], 'Saved partial result')
+            self.assertFalse(saved['complete'])
+            with self.assertRaises(ValueError):
+                run_chat(client, 'Refine', str(uuid.uuid4()), output, meta)
+            self.assertEqual(client.calls, 1)
+
+    def test_incomplete_chat_is_not_success_and_does_not_need_shell_handle_for_status(self):
+        class Incomplete:
+            def chat(self, message, message_id, on_event):
+                return {'complete': False, 'events': [], 'message_id': message_id}
+            def request(self, *args, **kwargs):
+                return {'turn_in_progress': False}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'run.json'
+            with self.assertRaisesRegex(ValueError, 'incomplete'):
+                run_chat(Incomplete(), 'Refine', str(uuid.uuid4()), output, {'command': 'refine'})
+            original = output.read_bytes()
+            with patch('jack.JackClient', return_value=Incomplete()), patch('sys.argv', ['jack.py', 'run-status', '--result', str(output)]), patch('sys.stdout', new_callable=io.StringIO) as out:
+                main()
+            status = json.loads(out.getvalue())
+            self.assertEqual(status['jack_turn_in_progress'], False)
+            self.assertEqual(status['complete'], False)
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_grouped_source_refinement_uses_guarded_cli_and_durable_result(self):
+        class Source(Fake):
+            def cv(self, **kwargs):
+                self.args = kwargs
+                return self.version
+            def chat(self, message, message_id, on_event):
+                self.message = message
+                on_event({'type': 'finish'})
+                return {'message_id': message_id, 'complete': True, 'events': [{'type': 'finish'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            context = Path(directory) / 'facts.txt'
+            context.write_text('Confirmed title and project identity only.')
+            output = Path(directory) / 'refined.json'
+            source_id = str(uuid.uuid4())
+            client = Source()
+            with patch('jack.JackClient', return_value=client), patch('sys.argv', ['jack.py', 'refine', '--source', source_id, '--input', str(context), '--message-id', str(uuid.uuid4()), '--result', str(output)]), patch('sys.stdout', new_callable=io.StringIO):
+                main()
+            self.assertEqual(client.args['source_id'], source_id)
+            self.assertIn('all pending right-panel recommendations', client.message)
+            self.assertIn('Never submit', client.message)
+            self.assertIn(context.read_text(), client.message)
+            self.assertTrue(json.loads(output.read_text())['complete'])
+
+    def test_simulation_finish_without_matching_receipt_is_not_success(self):
+        class NoSimulation:
+            def chat(self, message, message_id, on_event):
+                on_event({'type': 'finish'})
+                return {'complete': True, 'events': [{'type': 'finish'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'run.json'
+            with self.assertRaisesRegex(ValueError, 'simulator receipt'):
+                run_chat(NoSimulation(), 'Simulate', str(uuid.uuid4()), output,
+                         {'command': 'simulate', 'job_match_id': JOB, 'source_version_id': VERSION})
+            self.assertIsNone(json.loads(output.read_text())['simulation'])
+
+    def test_real_sse_disconnect_preserves_received_event_without_resend(self):
+        class BrokenStream(httpx.SyncByteStream):
+            def __iter__(self):
+                yield b'data: {"type":"text-delta","delta":"Checkpointed"}\n\n'
+                raise httpx.ReadTimeout('stream disconnected')
+        calls = []
+        def handler(request):
+            calls.append(request.url.path)
+            if request.url.path.endswith('/connect'):
+                return httpx.Response(200, json={'turn_in_progress': False})
+            return httpx.Response(200, stream=BrokenStream())
+        client = JackClient(httpx.Client(transport=httpx.MockTransport(handler)))
+        client._token = lambda: 'test-token'
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'run.json'
+            with self.assertRaises(httpx.ReadTimeout):
+                run_chat(client, 'Refine', str(uuid.uuid4()), output, {'command': 'refine'})
+            saved = json.loads(output.read_text())
+            self.assertEqual(saved['events'], [{'type': 'text-delta', 'delta': 'Checkpointed'}])
+            self.assertFalse(saved['complete'])
+            self.assertEqual(sum(p.endswith('/messages/stream') for p in calls), 1)
+
+    def test_decision_transport_timeout_is_read_back_once_without_resend(self):
+        class Timeout(Fake):
+            def request(self, method, path, **kwargs):
+                super().request(method, path, **kwargs)
+                raise httpx.ReadTimeout('response lost after commit')
+        client = Timeout(True)
+        self.assertTrue(accept_suggestion(client, JOB, THREAD, 'Robotics intern')['reconciled_after_conflict'])
+        self.assertEqual(len(client.writes), 1)
 
     def test_simulation_requires_actual_success_for_exact_job_and_source(self):
         events = [{'type': 'tool-input-available', 'toolCallId': 'call', 'toolName': 'run_application_simulation',

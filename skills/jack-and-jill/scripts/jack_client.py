@@ -104,7 +104,7 @@ class JackClient:
             raise RuntimeError('Jack did not return a valid DOCX')
         return raw
 
-    def chat(self, content, message_id):
+    def chat(self, content, message_id, on_event=None):
         if not isinstance(content, str) or not 1 <= len(content) <= 100_000:
             raise ValueError('Jack request must contain 1–100000 characters')
         identifier(message_id)
@@ -114,6 +114,14 @@ class JackClient:
         if ready.get('spend_limit_exceeded'):
             raise RuntimeError('Jack usage limit reached; wait until the service reset instead of retrying')
         events = []
+        def record(payload):
+            if payload == '[DONE]':
+                return
+            event = json.loads(payload)
+            if not str(event.get('type', '')).startswith('reasoning-'):
+                events.append(event)
+                if on_event:
+                    on_event(event)
         with self.http.stream('POST', API + '/jack-chat/messages/stream',
                               headers={'Authorization': 'Bearer ' + self._token(), 'Accept': 'text/event-stream'},
                               json={'content': content, 'client_msg_id': message_id, 'file_ids': [], 'page_context': None}) as r:
@@ -126,9 +134,8 @@ class JackClient:
                 elif not line and lines:
                     payload = '\n'.join(lines)
                     lines = []
-                    if payload != '[DONE]':
-                        events.append(json.loads(payload))
+                    record(payload)
             if lines:
-                events.append(json.loads('\n'.join(lines)))
+                record('\n'.join(lines))
         return {'message_id': message_id, 'complete': any(e.get('type') == 'finish' for e in events),
                 'events': [e for e in events if not str(e.get('type', '')).startswith('reasoning-')]}

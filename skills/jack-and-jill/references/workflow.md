@@ -31,9 +31,11 @@ For a role comment or inaccurate proposal, put verified source context in a UTF-
 & $jackPython $jackScript refine --job JOB_ID --thread THREAD_ID --input output/verified-facts.txt --message-id NEW_UUID --result output/refinement.json
 ```
 
-Review and decide the new edit, then re-read the current CV. For a comment with no supported change, record the source-backed resolution or unresolved factual gap using `resolve-note` and a JSON `reason` of at least 30 characters. That command resolves comments only, never fabricated edits. It currently requires a current role thread ID; inspect state after a conflict instead of retrying.
+For a master-CV correction use `refine --source SOURCE_ID` instead of `--job`; do not bypass the helper with a raw mutation script. Omit `--thread` to address compatible pending recommendations together in one request. Include the verified facts for the whole group; still review every individual proposed edit.
 
-The DOCX text is a **proposed final view**: tracked edits may already appear before acceptance. Only actual terminal thread status confirms a decision. Decisions can clone CV versions/thread IDs. On HTTP 409, accept/reject reads once and confirms only an actual terminal status; it never resends automatically. Do not mark success because the proposed words appear in the document.
+Review and decide the new edits, then re-read the current CV. For a comment with no supported change, use `resolve-note --job JOB_ID --thread THREAD_ID --input output/resolution.json --result output/resolved.json`. Use `--source SOURCE_ID` for a master comment. Input is `{"thread": FULL_REVIEWED_THREAD_OBJECT, "reason": "Source-backed explanation of at least 30 characters"}`. This command handles comments only. It confirms the reply by a fresh read, follows exact unchanged cloned thread IDs, then verifies the comment's terminal `resolved` status after deciding. A rejected/unknown status is not reported resolved. Its neighboring `.operation.json` records reply/decision phases before writes. Keep it on timeout/conflict: an uncertain reply or decision is not automatically resent. Reusing the same command/receipt checks current state without duplicating a confirmed reply; ambiguous states require inspection.
+
+The DOCX text is a **proposed final view**: tracked edits may already appear before acceptance. Only actual terminal thread status confirms a decision: suggestions become `accepted`/`rejected`, while completed comments become `resolved`. Decisions can clone CV versions/thread IDs. On HTTP 409, accept/reject reads once and confirms only an actual terminal status; it never resends automatically. Do not mark success because the proposed words appear in the document.
 
 ## Export and recovery
 
@@ -41,8 +43,20 @@ The DOCX text is a **proposed final view**: tracked edits may already appear bef
 & $jackPython $jackScript download --job JOB_ID --simulation output/jack-simulation.json --result output/download.json
 ```
 
-Export refuses unfinished CVs, open/orphaned notes, mismatched simulator reviews and different existing bytes at the same version path. Outputs go to the resolved Career Ops data root under `output/jack-and-jill/JOB/VERSION.docx`, with a hash/text receipt. Render and verify layout before delivery. Enforce candidate-specific banned text from Career Ops custom rules. The scripts do not submit applications.
+Export requires recognized terminal states (`accepted`/`rejected` for suggestions, `resolved` for comments) and refuses unfinished CVs, pending/unknown notes, mismatched simulator reviews and different existing bytes at the same version path. Outputs go to the resolved Career Ops data root under `output/jack-and-jill/JOB/VERSION.docx`, with a hash/text receipt. Render and verify layout before delivery. Enforce candidate-specific banned text from Career Ops custom rules. The scripts do not submit applications.
+
+Mirror enforceable candidate exclusions in the resolved data root's `config/jack-and-jill.json` (inspect and merge existing settings). For example, only for a candidate who requests these restrictions:
+
+```json
+{"forbid_work_authorization": true, "forbidden_phrases": ["an exact unwanted phrase"]}
+```
+
+Export loads this file automatically, normalizes whitespace/case and blocks matching text **before writing final files**. The status rule covers work authorization, citizenship and visa/employment sponsorship statements while allowing ordinary team fundraising/sponsorship achievements. Custom phrases are literal normalized text, not regular expressions. The receipt records the policy checked. Missing policy means no candidate-specific exclusions configured; it does not waive factual/layout review or guarantee detection of every paraphrase. Do not include private policy files in the public package.
 
 Jack's AI may take minutes; reads are usually faster. Retain the full shell result/session ID and poll that process. A `.sent.json` marker preserves the request UUID. A timeout or missing result means delivery is uncertain, not permission to resend. Inspect `chat-status`, current CV and retained results first. Never rerun completed simulations just to recover an observation handle. HTTP mutations are not automatically retried.
+
+Print the complete shell tool result, e.g. `text(await tools.exec_command(...))`, rather than only `.output`. Chat results now checkpoint received events to the original result file during streaming and on exceptions. An incomplete stream or missing exact simulator receipt exits as an error while preserving the partial result. The result path and sent marker block duplicate sends. If the shell handle is lost, use `run-status --result ORIGINAL_RESULT_PATH`: it reads the saved message/events and checks whether Jack currently has a turn running, without resending or overwriting anything. Jack's live flag is account-wide; it does not by itself identify which message is running. Never infer that an old incomplete request is safely repeatable from that flag being false.
+
+Track each role in its existing report: exact job/review, facts, every thread disposition, policy, final version/hash/path, render check and application state. After two equivalent failed corrections without new evidence, stop that correction and return its IDs/state to the coordinator. Finish unaffected checks; do not label the whole role complete while export/render or a required recommendation remains unfinished.
 
 Website APIs are unofficial and may change. They use only fixed Jack API and Clerk origins; tokens and pending login state are Windows-user DPAPI encrypted. Do not print or commit these files, copy browser cookies or bypass challenges. Official MCP credentials stay in host-managed OAuth storage. Review conflicts and service changes rather than suppressing errors.
